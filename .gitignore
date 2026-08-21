@@ -1,0 +1,21 @@
+# Security: NEVER commit API keys
+.env
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary Audio Files generated during testing
+*.mp3
+*.m4a
+*.wav
+
+# Mac OS & System junk
+.DS_Store
+.vscode/
