@@ -2,35 +2,41 @@ import os
 import uuid
 import json
 import logging
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Form
+import urllib.parse
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Form, Depends
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
 import uvicorn
-import urllib.parse
+
+# SQLAlchemy Dependencies
+from sqlalchemy.orm import Session
+from database import Base, engine, get_db
+from models import UserSessionModel
+
+# Initialize database tables
+Base.metadata.create_all(bind=engine)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | [%(levelname)s] | %(name)s | %(message)s",
-    handlers=[
-        logging.StreamHandler()  
-    ]
+    format="%(asctime)s | [%(levelname)s] | %(name)s | %(message)s"
 )
 logger = logging.getLogger("PRAGATI_BOT")
-
 
 load_dotenv()
 client = OpenAI()
 
 app = FastAPI(title="PRAGATI Helpline Voice Bot")
 
-user_sessions = {}
-
 class IntentRequest(BaseModel):
     session_id: str
     user_text: str
 
+
+# =====================================================================
+# SERVICE LAYER (Refactored with Database)
+# =====================================================================
 
 async def transcribe_service(audio_file: UploadFile) -> str:
     """Handles Audio -> Telugu Text conversion"""
@@ -58,21 +64,28 @@ async def transcribe_service(audio_file: UploadFile) -> str:
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
 
-async def process_intent_service(session_id: str, user_text: str) -> dict:
-    """Handles User Profile State Management + LLM Reasoning"""
-    logger.info(f"[LLM Intent] Processing request | Session ID: '{session_id}' | Input Text: \"{user_text}\"")
+async def process_intent_service(session_id: str, user_text: str, db: Session) -> dict:
+    """Handles User Profile State Management using SQLite + LLM Reasoning"""
+    logger.info(f"[LLM Intent] Processing request | Session ID: '{session_id}' | Input: \"{user_text}\"")
 
-    if session_id not in user_sessions:
-        logger.info(f"[LLM Intent] Creating new session profile for Session ID: '{session_id}'")
-        user_sessions[session_id] = {
+    # 1. Fetch or create session record in SQLite
+    db_session = db.query(UserSessionModel).filter(UserSessionModel.session_id == session_id).first()
+    
+    if not db_session:
+        logger.info(f"[LLM Intent] Creating new SQLite record for Session ID: '{session_id}'")
+        default_profile = {
             "age": None,
             "marital_status": None,
             "annual_income": None,
             "occupation": None
         }
+        db_session = UserSessionModel(session_id=session_id, profile=default_profile)
+        db.add(db_session)
+        db.commit()
+        db.refresh(db_session)
     
-    current_profile = user_sessions[session_id]
-    logger.info(f"[LLM Intent] Session '{session_id}' state before LLM call: {current_profile}")
+    current_profile = db_session.profile
+    logger.info(f"[LLM Intent] Current DB Profile for '{session_id}': {current_profile}")
     
     system_prompt = f"""
     You are an empathetic AI assistant guiding rural women in Telangana to find government schemes.
@@ -120,16 +133,18 @@ async def process_intent_service(session_id: str, user_text: str) -> dict:
             temperature=0.2
         )
         
-        ai_output = json.loads(response.choices[0].message.content)
-        user_sessions[session_id] = ai_output["updated_profile"]
+        ai_output = json.loads(response.choices[0].message.content) # type: ignore
         
-        logger.info(f"[LLM Intent] Success | Session: '{session_id}' | Complete: {ai_output['survey_complete']} | Updated Profile: {ai_output['updated_profile']}")
-        logger.info(f"[LLM Intent] Next Response (Telugu): \"{ai_output['next_response_telugu']}\"")
+        # 2. Update SQLite record with new profile JSON
+        db_session.profile = ai_output["updated_profile"]
+        db.commit()
+        db.refresh(db_session)
         
+        logger.info(f"[LLM Intent] Updated DB | Session: '{session_id}' | Profile: {db_session.profile}")
         return ai_output
 
     except Exception as e:
-        logger.error(f"[LLM Intent] Error processing intent for session '{session_id}': {str(e)}", exc_info=True)
+        logger.error(f"[LLM Intent] Error in session '{session_id}': {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -150,13 +165,17 @@ async def generate_audio_service(text: str, filepath: str):
         logger.info(f"[TTS Service] Success | Generated file: '{filepath}'")
 
     except Exception as e:
-        logger.error(f"[TTS Service] Error generating audio file '{filepath}': {str(e)}", exc_info=True)
+        logger.error(f"[TTS Service] Error generating audio: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# =====================================================================
+# API ROUTE HANDLERS
+# =====================================================================
+
 @app.get("/")
 def read_root():
-    return {"status": "active", "message": "PRAGATI Voice Helpline API is running"}
+    return {"status": "active", "message": "PRAGATI Voice Helpline API is running with SQLite backend"}
 
 
 @app.post("/api/v1/transcribe")
@@ -167,9 +186,8 @@ async def transcribe_endpoint(audio_file: UploadFile = File(...)):
 
 
 @app.post("/api/v1/process-intent")
-async def process_intent_endpoint(request: IntentRequest):
-    logger.info(f"--> POST /api/v1/process-intent request received for session '{request.session_id}'")
-    return await process_intent_service(request.session_id, request.user_text)
+async def process_intent_endpoint(request: IntentRequest, db: Session = Depends(get_db)):
+    return await process_intent_service(request.session_id, request.user_text, db)
 
 
 @app.post("/api/v1/generate-audio")
@@ -189,7 +207,8 @@ async def generate_audio_endpoint(text: str, background_tasks: BackgroundTasks):
 async def voice_chat_endpoint(
     session_id: str = Form(...),
     audio_file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = None
+    background_tasks: BackgroundTasks = None, # type: ignore
+    db: Session = Depends(get_db)
 ):
     logger.info(f"==========================================================")
     logger.info(f"--> [Voice Pipeline] New request | Session ID: '{session_id}'")
@@ -198,10 +217,7 @@ async def voice_chat_endpoint(
         # Step 1: Speech to Text
         logger.info("[Voice Pipeline] Step 1/3: Converting speech to text...")
         user_text = await transcribe_service(audio_file)
-        
-        # Step 2: Intent Engine
-        logger.info("[Voice Pipeline] Step 2/3: Evaluating state and next intent...")
-        intent_result = await process_intent_service(session_id, user_text)
+        intent_result = await process_intent_service(session_id, user_text, db)
         telugu_response = intent_result["next_response_telugu"]
         
         # Step 3: Text to Speech
@@ -222,15 +238,13 @@ async def voice_chat_endpoint(
             media_type="audio/mpeg",
             filename=filename,
             headers={
-                # Safely encode the Telugu text for HTTP transit
                 "X-User-Transcribed-Text": urllib.parse.quote(user_text),
                 "X-Survey-Complete": str(intent_result["survey_complete"]),
                 "X-Current-Profile": urllib.parse.quote(json.dumps(intent_result["updated_profile"]))
             }
         )
     except Exception as e:
-        logger.error(f"[Voice Pipeline] Pipeline failed for session '{session_id}': {str(e)}")
-        logger.info(f"==========================================================")
+        logger.error(f"[Voice Pipeline] Error in session '{session_id}': {str(e)}")
         raise e
 
 
