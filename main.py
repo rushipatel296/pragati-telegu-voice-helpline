@@ -18,6 +18,9 @@ from models import UserSessionModel
 # Initialize database tables
 Base.metadata.create_all(bind=engine)
 
+import chromadb
+from chromadb.utils import embedding_functions
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | [%(levelname)s] | %(name)s | %(message)s"
@@ -34,6 +37,26 @@ class IntentRequest(BaseModel):
     user_text: str
 
 
+
+# =====================================================================
+# RAG: VECTOR DATABASE SETUP
+# =====================================================================
+try:
+    chroma_client = chromadb.PersistentClient(path="./chroma_db")
+    openai_ef = embedding_functions.OpenAIEmbeddingFunction(
+        api_key=os.environ.get("OPENAI_API_KEY"),
+        model_name="text-embedding-3-small"
+    )
+    # Load the collection we created in ingest_schemes.py
+    schemes_collection = chroma_client.get_collection(
+        name="telangana_schemes", 
+        embedding_function=openai_ef # type: ignore
+    )
+    logger.info("✅ ChromaDB connected successfully.")
+except Exception as e:
+    logger.warning(f"⚠️ ChromaDB connection failed. Did you run ingest_schemes.py? Error: {e}")
+
+    
 # =====================================================================
 # SERVICE LAYER (Refactored with Database)
 # =====================================================================
@@ -65,10 +88,10 @@ async def transcribe_service(audio_file: UploadFile) -> str:
 
 
 async def process_intent_service(session_id: str, user_text: str, db: Session) -> dict:
-    """Handles User Profile State Management using SQLite + LLM Reasoning"""
+    """Handles User Profile State Management using SQLite + Dynamic RAG"""
     logger.info(f"[LLM Intent] Processing request | Session ID: '{session_id}' | Input: \"{user_text}\"")
 
-    # 1. Fetch or create session record in SQLite
+    # 1. Fetch or create session record
     db_session = db.query(UserSessionModel).filter(UserSessionModel.session_id == session_id).first()
     
     if not db_session:
@@ -77,7 +100,8 @@ async def process_intent_service(session_id: str, user_text: str, db: Session) -
             "age": None,
             "marital_status": None,
             "annual_income": None,
-            "occupation": None
+            "occupation": None,
+            "additional_notes": "" # NEW: Flexible field for dynamic eligibility data
         }
         db_session = UserSessionModel(session_id=session_id, profile=default_profile)
         db.add(db_session)
@@ -85,32 +109,61 @@ async def process_intent_service(session_id: str, user_text: str, db: Session) -
         db.refresh(db_session)
     
     current_profile = db_session.profile
-    logger.info(f"[LLM Intent] Current DB Profile for '{session_id}': {current_profile}")
     
+    # ---------------------------------------------------------
+    # 2. RAG RETRIEVAL: Query Translation & Search
+    # ---------------------------------------------------------
+    
+    # A. Translate the Telugu text to an English search query
+    translation_response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{
+            "role": "system", 
+            "content": f"You are a translator. Translate the following Telugu text into a short, keyword-rich English search query for finding government welfare schemes. Include the current profile details if relevant. Profile: {json.dumps(current_profile)}"
+        }, {
+            "role": "user", 
+            "content": user_text
+        }],
+        temperature=0.0 # 0.0 means maximum predictability
+    )
+    
+    english_search_query = translation_response.choices[0].message.content.strip() # type: ignore
+    logger.info(f"[RAG] Translated English Search Query: '{english_search_query}'")
+    
+    # B. Query ChromaDB using the English translated text
+    rag_results = schemes_collection.query(
+        query_texts=[english_search_query],
+        n_results=2 # Fetch the top 2 most relevant schemes
+    )
+    
+    retrieved_context = ""
+    if rag_results['documents'] and rag_results['documents'][0]:
+        for doc in rag_results['documents'][0]:
+            retrieved_context += f"- {doc}\n\n"
+            
+    logger.info(f"[RAG] Retrieved Schemes for context:\n{retrieved_context}")
+
+    # 3. Dynamic Agentic Prompt
     system_prompt = f"""
-    You are an empathetic AI assistant guiding rural women in Telangana to find government schemes.
+    You are an expert, empathetic government caseworker for rural women in Telangana.
     You speak completely in natural, polite Telugu script.
 
-    STRICT CONSTRAINTS:
-    1. You are ONLY allowed to collect: age, marital_status, annual_income, occupation.
-    2. NEVER ask for any other information (e.g., location, address, family size, district, name).
-    3. NEVER ask follow-up questions once all 4 fields are known.
-
-    CURRENT PROFILE:
+    CURRENT USER PROFILE:
     {json.dumps(current_profile)}
+
+    OFFICIAL SCHEMES (RETRIEVED FROM DATABASE):
+    {retrieved_context}
 
     USER LATEST STATEMENT:
     "{user_text}"
 
     EXECUTION STEPS:
-    Step 1: Extract new information and update profile fields.
-    Step 2: Check updated profile:
-            - IF ANY of the 4 fields are null:
-              * "survey_complete": false
-              * Ask ONE polite question in Telugu to gather ONE missing field.
-            - IF ALL 4 fields are NOT null:
-              * "survey_complete": true
-              * Recommend 1 to 3 relevant Telangana government schemes in polite Telugu.
+    Step 1: Extract any new information the user provided and update the profile fields. Put any specific scheme-related details (e.g., 'pregnant', 'has ration card') into "additional_notes".
+    Step 2: Analyze the OFFICIAL SCHEMES against the CURRENT USER PROFILE.
+    Step 3: Decide what to do next:
+            - IF you don't know the user's basic details (age, income), set "survey_complete": false and ask ONE basic question.
+            - IF you have basic details but the OFFICIAL SCHEMES require specific eligibility (e.g., White Ration Card, Government Hospital), set "survey_complete": false and ask ONE targeted question to check that specific criteria.
+            - IF the user meets all criteria for a retrieved scheme, set "survey_complete": true and recommend the scheme in Telugu, explaining exactly why they qualify.
 
     Respond ONLY in valid JSON matching this exact structure:
     {{
@@ -118,9 +171,10 @@ async def process_intent_service(session_id: str, user_text: str, db: Session) -
             "age": integer or null,
             "marital_status": string or null,
             "annual_income": integer or null,
-            "occupation": string or null
+            "occupation": string or null,
+            "additional_notes": string
         }},
-        "next_response_telugu": "Your Telugu text here",
+        "next_response_telugu": "Your Telugu question OR recommendation here",
         "survey_complete": boolean
     }}
     """
@@ -135,18 +189,17 @@ async def process_intent_service(session_id: str, user_text: str, db: Session) -
         
         ai_output = json.loads(response.choices[0].message.content) # type: ignore
         
-        # 2. Update SQLite record with new profile JSON
+        # 4. Update SQLite record with new profile
         db_session.profile = ai_output["updated_profile"]
         db.commit()
         db.refresh(db_session)
         
-        logger.info(f"[LLM Intent] Updated DB | Session: '{session_id}' | Profile: {db_session.profile}")
+        logger.info(f"[LLM Intent] Updated DB | Complete: {ai_output['survey_complete']}")
         return ai_output
 
     except Exception as e:
         logger.error(f"[LLM Intent] Error in session '{session_id}': {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
 
 async def generate_audio_service(text: str, filepath: str):
     """Handles Telugu Text -> MP3 conversion"""
