@@ -4,7 +4,9 @@ A Telugu-first AI caseworker concept for helping rural women explore Telangana w
 
 ## Live demo
 
-The public Streamlit demo uses curated, deterministic cases so it stays free to operate and does not expose an API key. The full local pipeline supports:
+**[Try PRAGATI on Streamlit](https://pragati-telugu.streamlit.app/)**
+
+The public demo uses curated, deterministic cases so it stays free to operate and does not expose an API key. The full local pipeline supports:
 
 `Telugu voice → speech-to-text → profile extraction → RAG retrieval → Telugu response → text-to-speech`
 
